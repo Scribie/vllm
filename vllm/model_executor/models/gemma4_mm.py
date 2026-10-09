@@ -33,6 +33,7 @@ from transformers.models.gemma4.configuration_gemma4 import (
     Gemma4TextConfig,
 )
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.model import get_served_model_name
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
@@ -104,6 +105,57 @@ logger = init_logger(__name__)
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 _VIDEO_MAX_SOFT_TOKENS = 70  # soft tokens per video frame (vs 280 for images)
 _VIDEO_MAX_FRAMES = 32  # max sampled frames per video
+
+
+def _gemma4_audio_seq_length_override(audio_ms_per_token: float) -> int | None:
+    """Soft-token ceiling for ``VLLM_GEMMA4_MAX_AUDIO_SECONDS``, or None.
+
+    None (env unset) means "keep the model's own processor_config value", i.e.
+    upstream behaviour. 300 s at 40 ms/token is 7500 tokens.
+    """
+    seconds = envs.VLLM_GEMMA4_MAX_AUDIO_SECONDS
+    if seconds is None:
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(
+            f"VLLM_GEMMA4_MAX_AUDIO_SECONDS must be a positive finite number, "
+            f"got {seconds!r}"
+        )
+    return int(seconds * 1000 / audio_ms_per_token)
+
+
+def _apply_gemma4_audio_cap(processor):
+    """Apply the configured audio ceiling to the (cached) HF processor.
+
+    One attribute drives the placeholder count, the encoder budget used for
+    memory profiling and the "Audio duration exceeds max" threshold, so they
+    cannot disagree. Idempotent; a no-op when the env var is unset.
+    """
+    if getattr(processor, "audio_seq_length", None) is None:
+        return processor
+    override = _gemma4_audio_seq_length_override(processor.audio_ms_per_token)
+    if override is not None:
+        processor.audio_seq_length = override
+    return processor
+
+
+def _gemma4_dummy_audio_len(processor) -> int:
+    """Sample count of the worst-case dummy audio used for memory profiling.
+
+    The tower feature extractor carries ``fft_length``; the unified
+    (encoder-free) extractor does not, and reading it raised AttributeError as
+    soon as audio became the profiled modality (audio_seq_length above video's
+    2496 tokens). Fall back to the full ceiling: ``audio_seq_length`` tokens
+    of ``audio_samples_per_token`` samples each.
+    """
+    extractor = processor.feature_extractor
+    fft_length = getattr(extractor, "fft_length", None)
+    if fft_length is not None:
+        return fft_length
+    per_token = getattr(extractor, "audio_samples_per_token", None)
+    if per_token is None:
+        per_token = int(extractor.sampling_rate * processor.audio_ms_per_token / 1000)
+    return processor.audio_seq_length * per_token
 
 
 def _get_max_soft_tokens(
@@ -220,9 +272,11 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         return params
 
     def get_hf_processor(self, **kwargs: object) -> Gemma4Processor:
-        return self.ctx.get_hf_processor(
-            Gemma4Processor,
-            **kwargs,
+        return _apply_gemma4_audio_cap(
+            self.ctx.get_hf_processor(
+                Gemma4Processor,
+                **kwargs,
+            )
         )
 
     def validate_num_items(self, modality: str, num_items: int) -> None:
@@ -400,6 +454,21 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         num_tokens = self._compute_audio_num_tokens(
             audio_len, sampling_rate, processor.audio_seq_length
         )
+        if envs.VLLM_GEMMA4_AUDIO_OVERLENGTH:
+            if envs.VLLM_GEMMA4_AUDIO_OVERLENGTH != "refuse":
+                raise ValueError(
+                    "VLLM_GEMMA4_AUDIO_OVERLENGTH must be unset or 'refuse', "
+                    f"got {envs.VLLM_GEMMA4_AUDIO_OVERLENGTH!r}"
+                )
+            uncapped = self._compute_audio_num_tokens(
+                audio_len, sampling_rate, 2**31 - 1
+            )
+            if uncapped > processor.audio_seq_length:
+                raise ValueError(
+                    f"refusing over-length audio: {audio_len} samples need "
+                    f"{uncapped} soft tokens > ceiling "
+                    f"{processor.audio_seq_length}; not silently dropping the tail"
+                )
         config = self.get_hf_config()
         token_ids = (
             [config.boa_token_id]
@@ -501,7 +570,7 @@ class Gemma4DummyInputsBuilder(BaseDummyInputsBuilder[Gemma4ProcessingInfo]):
         }
 
         if num_audios > 0:
-            audio_len = processor.feature_extractor.fft_length
+            audio_len = _gemma4_dummy_audio_len(processor)
             data["audio"] = self._get_dummy_audios(
                 length=audio_len,
                 num_audios=num_audios,

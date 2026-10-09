@@ -77,6 +77,8 @@ if TYPE_CHECKING:
     VLLM_MEDIA_URL_ALLOW_REDIRECTS: bool = True
     VLLM_MEDIA_LOADING_THREAD_COUNT: int = 8
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
+    VLLM_GEMMA4_MAX_AUDIO_SECONDS: float | None = None
+    VLLM_GEMMA4_AUDIO_OVERLENGTH: str = ""
     VLLM_MAX_AUDIO_DECODE_DURATION_S: int = 600
     VLLM_MAX_AUDIO_DECODE_BYTES: int = 268_435_456
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
@@ -987,6 +989,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Maximum filesize in MB for a single audio file when processing
     # speech-to-text requests. Files larger than this will be rejected.
     # Default is 25 MB
+    # Max audio duration (seconds) Gemma 4 accepts per clip. Unset keeps the
+    # model's own processor_config.json value (30 s for google/gemma-4-12B-it).
+    "VLLM_GEMMA4_MAX_AUDIO_SECONDS": lambda: (
+        float(os.environ["VLLM_GEMMA4_MAX_AUDIO_SECONDS"])
+        if os.environ.get("VLLM_GEMMA4_MAX_AUDIO_SECONDS", "").strip()
+        else None
+    ),
+    # "" (default): a clip longer than the ceiling is clipped with a warning
+    # (upstream behaviour). "refuse": such a clip raises instead.
+    "VLLM_GEMMA4_AUDIO_OVERLENGTH": lambda: os.environ.get(
+        "VLLM_GEMMA4_AUDIO_OVERLENGTH", ""
+    ).strip(),
     "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": lambda: int(
         os.getenv("VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", "25")
     ),

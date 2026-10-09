@@ -44,6 +44,7 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4MultimodalEmbedder,
     Gemma4MultiModalProcessor,
     Gemma4ProcessingInfo,
+    _apply_gemma4_audio_cap,
     _get_max_soft_tokens,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
@@ -153,9 +154,11 @@ class Gemma4UnifiedProcessingInfo(Gemma4ProcessingInfo):
         return self.ctx.get_hf_config(Gemma4UnifiedConfig)
 
     def get_hf_processor(self, **kwargs: object) -> Gemma4UnifiedProcessor:
-        return self.ctx.get_hf_processor(
-            Gemma4UnifiedProcessor,
-            **kwargs,
+        return _apply_gemma4_audio_cap(
+            self.ctx.get_hf_processor(
+                Gemma4UnifiedProcessor,
+                **kwargs,
+            )
         )
 
     def get_mm_max_tokens_per_item(
